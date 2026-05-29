@@ -1,140 +1,155 @@
-"""FinAlly FastAPI application — lifespan, global state, and router registration."""
+"""FinAlly FastAPI application.
+
+Entry point: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+Serves:
+  /api/*           REST endpoints
+  /api/stream/*    SSE streaming
+  /*               Static files (Next.js export, production only)
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-load_dotenv()  # Load .env from cwd (works when cwd is /app in Docker)
+from .config import config, get_openrouter_api_key
+from .db import get_positions, get_tracked_tickers, get_user, init_db, insert_portfolio_snapshot, open_db
+from .market import PriceCache, create_market_data_source
+from .routes.chat import router as chat_router
+from .routes.health import router as health_router
+from .routes.portfolio import router as portfolio_router
+from .routes.stream import router as stream_router
+from .routes.watchlist import router as watchlist_router
 
-from app.config import config
-from app.llm import create_llm_service
-from app.market import PriceCache, create_market_data_source, create_stream_router
-from app.routes.chat import router as chat_router
-from app.routes.health import router as health_router
-from app.routes.portfolio import router as portfolio_router
-from app.routes.watchlist import router as watchlist_router
-from database import get_db, init_db
+# Load .env from project root (two levels above app/)
+_ENV_PATH = Path(__file__).parent.parent.parent / ".env"
+if _ENV_PATH.exists():
+    load_dotenv(_ENV_PATH)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# Module-level cache so lifespan helpers can reference it
-price_cache: PriceCache = PriceCache()
-
-
-# --- Lifespan ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Assert API key unless mock mode
-    llm_mock = os.getenv("LLM_MOCK", "false").lower() == "true"
-    if not llm_mock and not os.getenv("OPENROUTER_API_KEY"):
-        raise RuntimeError(
-            "OPENROUTER_API_KEY is not set. Add it to .env. Set LLM_MOCK=true to skip."
-        )
-
-    # 2. Init DB — creates tables and seeds on first run
-    init_db(config.db_path)
-
-    # 3. Collect tickers from watchlist + open positions
-    db = get_db(config.db_path)
+    """Application lifecycle: startup initialization and graceful shutdown."""
+    # 1. Assert required env vars (fast boot failure if missing)
     try:
-        watchlist_rows = db.execute(
-            "SELECT ticker FROM watchlist WHERE user_id = 'default'"
-        ).fetchall()
-        position_rows = db.execute(
-            "SELECT ticker FROM positions WHERE user_id = 'default' AND quantity > 0"
-        ).fetchall()
-        initial_tickers = list(
-            {row["ticker"] for row in watchlist_rows} | {row["ticker"] for row in position_rows}
-        )
-    finally:
-        db.close()
+        get_openrouter_api_key()
+    except RuntimeError as exc:
+        logger.critical("Boot failure: %s", exc)
+        raise SystemExit(1) from exc
 
-    # 4. Start market data source
+    # 2. Initialize database (idempotent: creates tables + seeds if empty)
+    async with open_db() as db:
+        await init_db(db)
+        initial_tickers = await get_tracked_tickers(db)
+
+    logger.info(
+        "DB initialized. Tracking %d tickers: %s", len(initial_tickers), sorted(initial_tickers)
+    )
+
+    # 3. Start market data source (simulator or Massive); seeds price cache
+    price_cache = PriceCache()
     market_source = create_market_data_source(price_cache)
-    await market_source.start(initial_tickers)
+    await market_source.start(initial_tickers or config.DEFAULT_TICKERS)
+    logger.info("Market data source started")
+
+    # 4. Initial portfolio snapshot (price cache is warm, valuation is valid)
+    async with open_db() as db:
+        user = await get_user(db, "default")
+        positions = await get_positions(db, "default")
+        if user:
+            total_value = user["cash_balance"] + sum(
+                (price_cache.get_price(p["ticker"]) or 0.0) * p["quantity"]
+                for p in positions
+            )
+            await insert_portfolio_snapshot(db, "default", total_value)
+            await db.commit()
+
+    # 5. Background portfolio snapshot writer
+    snapshot_task = asyncio.create_task(
+        _portfolio_snapshot_loop(price_cache), name="portfolio-snapshot"
+    )
+
+    # 6. Expose shared state to route handlers via app.state
+    app.state.price_cache = price_cache
     app.state.market_source = market_source
 
-    # 5. Create LLM service
-    app.state.llm_service = create_llm_service()
-
-    # 6. Record an immediate portfolio snapshot
-    asyncio.create_task(_record_snapshot())
-
-    # 7. Start periodic snapshot writer
-    snapshot_task = asyncio.create_task(_snapshot_loop())
-
+    logger.info("FinAlly backend ready on port 8000")
     yield
 
-    # Shutdown
+    # Shutdown — cancel background tasks, stop market source
     snapshot_task.cancel()
     try:
         await snapshot_task
     except asyncio.CancelledError:
         pass
     await market_source.stop()
+    logger.info("FinAlly backend shut down cleanly")
 
 
-# --- Background helpers ---
-
-async def _record_snapshot() -> None:
-    """Write one portfolio total-value snapshot to the DB."""
-    db = get_db(config.db_path)
-    try:
-        rows = db.execute(
-            "SELECT ticker, quantity, avg_cost FROM positions WHERE user_id = 'default' AND quantity > 0"
-        ).fetchall()
-        cash_row = db.execute(
-            "SELECT cash_balance FROM users_profile WHERE id = 'default'"
-        ).fetchone()
-        cash = cash_row["cash_balance"] if cash_row else 0.0
-        total = cash + sum(
-            row["quantity"] * (price_cache.get_price(row["ticker"]) or row["avg_cost"])
-            for row in rows
-        )
-        db.execute(
-            "INSERT INTO portfolio_snapshots (id, user_id, total_value, recorded_at) VALUES (?, 'default', ?, ?)",
-            (str(uuid.uuid4()), round(total, 2), datetime.now(timezone.utc).isoformat()),
-        )
-        db.commit()
-    finally:
-        db.close()
-
-
-async def _snapshot_loop() -> None:
-    """Periodically record portfolio snapshots."""
+async def _portfolio_snapshot_loop(price_cache: PriceCache) -> None:
+    """Record portfolio total value every PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS."""
+    interval = config.PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS
     while True:
-        await asyncio.sleep(config.portfolio_snapshot_interval_seconds)
+        await asyncio.sleep(interval)
         try:
-            await _record_snapshot()
-        except Exception as exc:
-            logger.error("Snapshot error: %s", exc)
+            async with open_db() as db:
+                user = await get_user(db, "default")
+                positions = await get_positions(db, "default")
+                if user:
+                    total_value = user["cash_balance"] + sum(
+                        (price_cache.get_price(p["ticker"]) or 0.0) * p["quantity"]
+                        for p in positions
+                    )
+                    await insert_portfolio_snapshot(db, "default", total_value)
+                    await db.commit()
+        except Exception:
+            logger.exception("Portfolio snapshot loop error")
 
 
-# --- App assembly ---
+def create_app() -> FastAPI:
+    application = FastAPI(
+        title="FinAlly API",
+        description="AI-powered trading workstation backend",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
 
-app = FastAPI(title="FinAlly API", lifespan=lifespan)
+    # CORS: allow Next.js dev server (port 3000) and same-origin in production
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://localhost:8000"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-app.state.price_cache = price_cache
-app.state.market_source = None  # Set during lifespan after source starts
+    # API routes
+    application.include_router(health_router)
+    application.include_router(stream_router)
+    application.include_router(portfolio_router)
+    application.include_router(watchlist_router)
+    application.include_router(chat_router)
 
-stream_router = create_stream_router(price_cache)
-app.include_router(health_router)
-app.include_router(stream_router)
-app.include_router(portfolio_router)
-app.include_router(watchlist_router)
-app.include_router(chat_router)
+    return application
 
-# Serve static Next.js export — must be last so API routes take precedence
-_static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
-if os.path.isdir(_static_dir):
-    app.mount("/", StaticFiles(directory=_static_dir, html=True), name="static")
+
+app = create_app()
+
+# Static file serving (production: Next.js export built into static/)
+_STATIC_DIR = Path(__file__).parent.parent.parent / "static"
+if _STATIC_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")

@@ -1,7 +1,6 @@
-"""LLM package — exports service classes and factory."""
+"""LLM integration for FinAlly chat assistant."""
 
-from app.llm.factory import create_llm_service
-from app.llm.mock import MockLLMService
-from app.llm.service import LLMService
+from .client import ChatResponse, call_llm
+from .mock import mock_llm_response
 
-__all__ = ["LLMService", "MockLLMService", "create_llm_service"]
+__all__ = ["ChatResponse", "call_llm", "mock_llm_response"]

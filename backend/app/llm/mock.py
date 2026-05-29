@@ -1,25 +1,25 @@
-"""Mock LLM service for testing and development (LLM_MOCK=true)."""
+"""Mock LLM responses for testing (LLM_MOCK=true).
+
+Two deterministic fixtures:
+- Default: a plain conversational reply, no trades or watchlist changes.
+- Trade-trigger: triggered by "mock-trade" in the user message. Buys 1 share of AAPL.
+"""
 
 from __future__ import annotations
 
-from app.llm.models import LLMResponse, TradeAction
+from .client import ChatResponse, TradeAction, WatchlistAction
 
 
-class MockLLMService:
-    async def chat(
-        self,
-        user_message: str,
-        portfolio_context: dict,
-        history: list[dict],
-    ) -> LLMResponse:
-        if "mock-trade" in user_message.lower():
-            return LLMResponse(
-                message="Mock response: buying 1 share of AAPL.",
-                trades=[TradeAction(ticker="AAPL", side="buy", quantity=1)],
-                watchlist_changes=[],
-            )
-        return LLMResponse(
-            message="Mock response: I'm here to help. Tell me what you'd like to do.",
-            trades=[],
+def mock_llm_response(user_message: str) -> ChatResponse:
+    """Return a deterministic ChatResponse based on a simple substring match."""
+    if "mock-trade" in user_message.lower():
+        return ChatResponse(
+            message="Mock response: buying 1 share of AAPL.",
+            trades=[TradeAction(ticker="AAPL", side="buy", quantity=1)],
             watchlist_changes=[],
         )
+    return ChatResponse(
+        message="Mock response: I'm here to help. Tell me what you'd like to do.",
+        trades=[],
+        watchlist_changes=[],
+    )
