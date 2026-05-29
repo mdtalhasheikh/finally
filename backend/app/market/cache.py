@@ -17,25 +17,48 @@ class PriceCache:
 
     def __init__(self) -> None:
         self._prices: dict[str, PriceUpdate] = {}
+        self._session_opens: dict[str, float] = {}  # First observed price per ticker
         self._lock = Lock()
         self._version: int = 0  # Monotonically increasing; bumped on every update
 
-    def update(self, ticker: str, price: float, timestamp: float | None = None) -> PriceUpdate:
+    def update(
+        self,
+        ticker: str,
+        price: float,
+        timestamp: float | None = None,
+        session_open: float | None = None,
+    ) -> PriceUpdate:
         """Record a new price for a ticker. Returns the created PriceUpdate.
 
         Automatically computes direction and change from the previous price.
         If this is the first update for the ticker, previous_price == price (direction='flat').
+
+        session_open: if provided (Massive mode, mapped from Polygon day.open), stored and used
+        as the daily-change reference. If not provided, the first observed price is captured
+        and held for the process lifetime (simulator mode).
         """
         with self._lock:
             ts = timestamp or time.time()
             prev = self._prices.get(ticker)
             previous_price = prev.price if prev else price
+            rounded_price = round(price, 2)
+
+            if session_open is not None:
+                so = round(session_open, 2)
+                self._session_opens[ticker] = so
+            elif ticker in self._session_opens:
+                so = self._session_opens[ticker]
+            else:
+                # First observation — capture as session_open and hold for process lifetime
+                so = rounded_price
+                self._session_opens[ticker] = so
 
             update = PriceUpdate(
                 ticker=ticker,
-                price=round(price, 2),
+                price=rounded_price,
                 previous_price=round(previous_price, 2),
                 timestamp=ts,
+                session_open=so,
             )
             self._prices[ticker] = update
             self._version += 1
@@ -60,6 +83,7 @@ class PriceCache:
         """Remove a ticker from the cache (e.g., when removed from watchlist)."""
         with self._lock:
             self._prices.pop(ticker, None)
+            self._session_opens.pop(ticker, None)
 
     @property
     def version(self) -> int:

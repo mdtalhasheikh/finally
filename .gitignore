@@ -7,3 +7,12 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+*.db
+db/finally.db
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+node_modules/
+.next/
