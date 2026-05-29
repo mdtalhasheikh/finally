@@ -1,1 +1,13 @@
-{}
+{
+  "teammateMode": "in-process",
+  "permissions": {
+    "allow": [
+      "Bash(uv run --extra dev pytest *)",
+      "Bash(uv run uvicorn *)",
+      "Bash(curl *)",
+      "Bash(npm install *)",
+      "Bash(npx playwright *)",
+      "Bash(kill *)"
+    ]
+  }
+}
