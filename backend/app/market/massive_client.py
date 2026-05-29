@@ -101,10 +101,19 @@ class MassiveDataSource(MarketDataSource):
                     price = snap.last_trade.price
                     # Massive timestamps are Unix milliseconds → convert to seconds
                     timestamp = snap.last_trade.timestamp / 1000.0
+                    # Extract day.open for daily change reference; fall back to None
+                    # so PriceCache captures first observed price (simulator-style fallback)
+                    day_open: float | None = None
+                    try:
+                        if snap.day and snap.day.open:
+                            day_open = float(snap.day.open)
+                    except (AttributeError, TypeError, ValueError):
+                        pass
                     self._cache.update(
                         ticker=snap.ticker,
                         price=price,
                         timestamp=timestamp,
+                        session_open=day_open,
                     )
                     processed += 1
                 except (AttributeError, TypeError) as e:
